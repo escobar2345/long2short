@@ -3,6 +3,9 @@ import fs from "fs";
 import path from "path";
 import { execFile, execFileSync } from "child_process";
 import { promisify } from "util";
+import { Readable } from "stream";
+import { pipeline } from "stream/promises";
+import { withRetry } from "./retry";
 import { localFileUrl, remuxIfNeeded } from "./youtube";
 import { parseSubtitleText } from "./subtitles";
 import type { TranscriptWord } from "./types";
@@ -19,6 +22,117 @@ const execFileAsync = promisify(execFile);
 
 export function isYouTubeUrl(url: string): boolean {
   return /(?:^|\.)youtube\.com|youtu\.be/i.test(url);
+}
+
+/* ------------------------------------------------------------------ */
+/* Box.com shared-file links                                           */
+/*                                                                     */
+/* Shape: https://<tenant>.box.com/s/<sharedName>[...]/file/<fileId>.  */
+/* yt-dlp has no Box extractor (Box serves files behind its own JS     */
+/* app + API session flow), so Box is handled natively here: metadata  */
+/* via Box's public shared_items API (BoxApi header, no OAuth needed   */
+/* for public shares) and downloads via the shared-file download       */
+/* endpoint. Shares that are password-protected or restricted to the   */
+/* owner's organization 401 on that API — no tool can read them        */
+/* without credentials, so we fail with an honest, specific message.   */
+/* ------------------------------------------------------------------ */
+
+export function isBoxShareUrl(url: string): boolean {
+  return /box\.com\/s\/[A-Za-z0-9]+/i.test(url);
+}
+
+function parseBoxShare(
+  url: string
+): { sharedName: string; fileId?: string; sharedLinkUrl: string } | null {
+  const m = url.match(/(https?:\/\/[^/]*box\.com)\/s\/([A-Za-z0-9]+)/i);
+  if (!m) return null;
+  const f = url.match(/\/file\/(\d+)/i);
+  return {
+    sharedName: m[2],
+    fileId: f?.[1],
+    sharedLinkUrl: `${m[1]}/s/${m[2]}`,
+  };
+}
+
+const BOX_API = "https://api.box.com/2.0";
+const VIDEO_EXT = /\.(mp4|mov|m4v|webm|mkv|avi|mpe?g|flv|ts)$/i;
+
+interface BoxItem {
+  type: string;
+  id: string;
+  name: string;
+  size?: number;
+}
+
+/**
+ * Reads a Box shared item via the public shared_items API (no OAuth for
+ * public shares). "restricted" = Box answered 401/404, i.e. the share is
+ * password-protected or members-only. null = network/shape surprise.
+ */
+async function boxSharedItem(
+  sharedLinkUrl: string
+): Promise<BoxItem | "restricted" | null> {
+  try {
+    const res = await withRetry(
+      () =>
+        fetch(`${BOX_API}/shared_items`, {
+          headers: { BoxApi: `shared_link=${encodeURIComponent(sharedLinkUrl)}` },
+        }),
+      2
+    );
+    if (res.status === 401 || res.status === 404) return "restricted";
+    if (!res.ok) return null;
+    const j: any = await res.json();
+    if (!j?.id) return null;
+    return {
+      type: String(j.type ?? "file"),
+      id: String(j.id),
+      name: String(j.name ?? "box-file"),
+      size: Number(j.size) || undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Public shared-file direct download (no headers needed for public shares). */
+function boxDirectDownloadUrl(sharedName: string, fileId: string): string {
+  return (
+    `https://app.box.com/index.php?rm=box_download_shared_file` +
+    `&shared_name=${encodeURIComponent(sharedName)}&file_id=${fileId}`
+  );
+}
+
+/** The honest, specific error for Box links that require credentials. */
+function boxRestrictedError(): Error {
+  return new Error(
+    "This Box.com share link is not publicly accessible — Box's own API " +
+      "reports it as password-protected or restricted to the file owner's " +
+      "organization, so no downloader can fetch it without those credentials. " +
+      "If you can open it in your browser, download the video there and paste " +
+      "a direct .mp4/.webm link instead. Public Box links (\"anyone with the " +
+      "link\" sharing) download automatically."
+  );
+}
+
+/** Duration of a remote video URL via ffprobe (headers-only read). */
+function ffprobeUrlDuration(u: string): number | undefined {
+  try {
+    const out = execFileSync(
+      "ffprobe",
+      [
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        u,
+      ],
+      { windowsHide: true, timeout: 45_000 }
+    );
+    const d = parseFloat(String(out).trim());
+    return Number.isFinite(d) ? Math.round(d) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Stable, filesystem-safe cache key for any URL. */
@@ -145,6 +259,39 @@ function ffprobeDuration(file: string): number {
 export async function probeMetadata(
   url: string
 ): Promise<{ title?: string; durationSec?: number; errorDetail?: string }> {
+  // Box.com shares bypass yt-dlp entirely (no Box extractor exists): read
+  // the item through Box's own shared_items API. Errors thrown here are
+  // specific (restricted / folder / not-a-video) and propagate to the UI —
+  // they must NOT be swallowed into errorDetail below.
+  if (isBoxShareUrl(url)) {
+    const box = parseBoxShare(url);
+    if (!box) {
+      throw new Error("That Box.com link isn't a recognizable share link.");
+    }
+    const item = await boxSharedItem(box.sharedLinkUrl);
+    if (item === "restricted") {
+      console.error(`[anywhere] box share restricted (401): ${box.sharedLinkUrl}`);
+      throw boxRestrictedError();
+    }
+    if (item) {
+      if (item.type !== "file") {
+        throw new Error(
+          "That Box.com link points to a folder, not a single video file — " +
+            "share the video file itself (its own link) and try again."
+        );
+      }
+      if (!VIDEO_EXT.test(item.name)) {
+        throw new Error(
+          `This Box file ("${item.name}") is not a video — pick an ` +
+            `.mp4/.mov/.webm file.`
+        );
+      }
+      const dl = boxDirectDownloadUrl(box.sharedName, item.id);
+      return { title: item.name, durationSec: ffprobeUrlDuration(dl) };
+    }
+    // null → fall through to yt-dlp (best effort) for odd cases
+  }
+
   try {
     const stdout = await ytDlpRun(["--no-warnings", "--dump-single-json"], url, 90_000);
     const j = JSON.parse(stdout);
@@ -206,6 +353,59 @@ export async function ensureVideoFileAnyUrl(url: string): Promise<AnyUrlResult> 
         meta.durationSec && meta.durationSec > 0
           ? meta.durationSec
           : ffprobeDuration(finalPath),
+    };
+  }
+
+  // Box.com shares: yt-dlp has no Box extractor, so download natively. Public
+  // shares stream straight from Box's shared-file endpoint; restricted ones
+  // (401 on Box's API — e.g. corporate-tenant shares) fail with an honest
+  // message instead of a confusing yt-dlp failure.
+  if (isBoxShareUrl(url)) {
+    const box = parseBoxShare(url);
+    if (!box) {
+      throw new Error("That Box.com link isn't a recognizable share link.");
+    }
+    const item = await boxSharedItem(box.sharedLinkUrl);
+    if (item === "restricted") {
+      console.error(`[anywhere] box share restricted (401): ${box.sharedLinkUrl}`);
+      throw boxRestrictedError();
+    }
+    if (!item || item.type !== "file") {
+      throw new Error(
+        "That Box.com link points to a folder or an unreadable item, not a " +
+          "single video file — share the video file itself and try again."
+      );
+    }
+    if (!VIDEO_EXT.test(item.name)) {
+      throw new Error(
+        `This Box file ("${item.name}") is not a video — pick an ` +
+          `.mp4/.mov/.webm file.`
+      );
+    }
+    console.error(
+      `[anywhere] box: downloading public file ${item.id} ` +
+        `(${item.name}${item.size ? `, ${item.size} bytes` : ""})`
+    );
+    const res = await withRetry(
+      () => fetch(boxDirectDownloadUrl(box.sharedName, item.id), { redirect: "follow" }),
+      2
+    );
+    const ct = String(res.headers.get("content-type") ?? "");
+    // Box serves an HTML shell (not the file) when the share isn't usable.
+    if (!res.ok || !res.body || /text\/html/i.test(ct)) {
+      throw boxRestrictedError();
+    }
+    const tmp = `${finalPath}.part`;
+    await pipeline(Readable.fromWeb(res.body as any), fs.createWriteStream(tmp));
+    fs.renameSync(tmp, finalPath);
+    if (fs.statSync(finalPath).size < 100_000) {
+      throw boxRestrictedError();
+    }
+    return {
+      fileUrl: localFileUrl(relPath),
+      transcript: [], // Box files carry no caption tracks
+      title: item.name,
+      durationSec: ffprobeDuration(finalPath),
     };
   }
 
