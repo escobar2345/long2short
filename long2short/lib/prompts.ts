@@ -3,8 +3,13 @@
 // creator's tuned prompt survives reloads and restarts.
 import fs from "fs";
 import path from "path";
+import { getStore } from "./storage";
 
-const PROMPTS_FILE = path.join(process.cwd(), "data", "prompts.json");
+// Same home as accounts.json — data/ locally, /tmp on read-only hosts
+// (Vercel). Resolved per call so cold starts always read the right place.
+function promptsFile(): string {
+  return path.join(getStore().dir, "prompts.json");
+}
 
 export const DEFAULT_EDIT_SYSTEM_PROMPT = `You are an expert short-form video editor. You are given:
 1) a long-form video's transcript with word-level timestamps,
@@ -44,7 +49,7 @@ type EditPlan = {
 
 export function getSavedSystemPrompt(): string | null {
   try {
-    const j = JSON.parse(fs.readFileSync(PROMPTS_FILE, "utf8"));
+    const j = JSON.parse(fs.readFileSync(promptsFile(), "utf8"));
     const p = j?.editSystemPrompt;
     return typeof p === "string" && p.trim().length ? p : null;
   } catch {
@@ -55,9 +60,9 @@ export function getSavedSystemPrompt(): string | null {
 export function saveSystemPrompt(prompt: string | null): void {
   if (!prompt || !prompt.trim().length) {
     // null/empty = reset to default
-    fs.rmSync(PROMPTS_FILE, { force: true });
+    fs.rmSync(promptsFile(), { force: true });
     return;
   }
-  fs.mkdirSync(path.dirname(PROMPTS_FILE), { recursive: true });
-  fs.writeFileSync(PROMPTS_FILE, JSON.stringify({ editSystemPrompt: prompt }, null, 2));
+  fs.mkdirSync(path.dirname(promptsFile()), { recursive: true });
+  fs.writeFileSync(promptsFile(), JSON.stringify({ editSystemPrompt: prompt }, null, 2));
 }

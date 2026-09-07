@@ -5,7 +5,7 @@
 // see their connected channels at a glance. Tokens are masked by the server
 // before they ever reach this component.
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import type { PublicAccount, AccountChannels } from "../../lib/clientTypes";
 import {
   stepStyle,
@@ -31,6 +31,22 @@ export default function AccountsManager({ accounts, onChanged }: Props) {
   const [orgId, setOrgId] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [storageNote, setStorageNote] = useState<string | null>(null);
+
+  // The server knows whether storage is persistent (it isn't on Vercel —
+  // /tmp only). Pick up its note on mount and whenever the list refreshes.
+  useEffect(() => {
+    let alive = true;
+    fetch("/api/accounts")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (alive && d?.storageNote) setStorageNote(d.storageNote);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [accounts.length]);
 
   async function handleAdd() {
     if (!name.trim() || !token.trim()) return;
@@ -44,6 +60,7 @@ export default function AccountsManager({ accounts, onChanged }: Props) {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? "Failed to add account");
+      if (data.storageNote) setStorageNote(data.storageNote);
       setName("");
       setToken("");
       setOrgId("");
@@ -113,6 +130,23 @@ export default function AccountsManager({ accounts, onChanged }: Props) {
         organization automatically. Only type the Organization ID manually if
         your token reaches multiple Buffer organizations.
       </p>
+
+      {storageNote && (
+        <div
+          style={{
+            marginTop: 10,
+            padding: "10px 12px",
+            fontSize: 13,
+            lineHeight: 1.45,
+            color: "#92400e",
+            background: "#fffbeb",
+            border: "1px solid #fcd34d",
+            borderRadius: 8,
+          }}
+        >
+          {storageNote}
+        </div>
+      )}
 
       {error && (
         <div style={{ marginTop: 10, color: BAD, fontSize: 13 }}>{error}</div>

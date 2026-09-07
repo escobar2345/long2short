@@ -1,15 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
-import { addAccount, listAccounts, publicAccount } from "../../../lib/accounts";
+import {
+  addAccount,
+  listAccounts,
+  publicAccount,
+  accountsStorageNote,
+} from "../../../lib/accounts";
 
 export const runtime = "nodejs";
-// Reads/writes data/accounts.json — never serve a cached/prerendered copy.
+// Reads/writes the accounts store — never serve a cached/prerendered copy.
 export const dynamic = "force-dynamic";
 
 /** List every saved Buffer account (access tokens masked). */
 export async function GET() {
   try {
     const accounts = await listAccounts();
-    return NextResponse.json({ accounts: accounts.map(publicAccount) });
+    return NextResponse.json({
+      accounts: accounts.map(publicAccount),
+      storageNote: accountsStorageNote(),
+    });
   } catch (err: any) {
     return NextResponse.json({ error: err.message ?? "Failed to load accounts" }, { status: 500 });
   }
@@ -26,7 +34,10 @@ export async function POST(req: NextRequest) {
       );
     }
     const account = await addAccount({ name, accessToken, organizationId });
-    return NextResponse.json({ account: publicAccount(account) }, { status: 201 });
+    return NextResponse.json(
+      { account: publicAccount(account), storageNote: accountsStorageNote() },
+      { status: 201 }
+    );
   } catch (err: any) {
     return NextResponse.json({ error: err.message ?? "Failed to add account" }, { status: 400 });
   }

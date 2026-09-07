@@ -5,8 +5,10 @@
 // can then run against any subset of them SIMULTANEOUSLY (see
 // app/api/buffer/post/route.ts which fans out across accounts in parallel).
 //
-// Storage is a plain JSON file under data/ (gitignored) — deliberately not a
-// database since this project has no DB dependency and this is a local tool.
+// Storage is a plain JSON file — next to the code under data/ (gitignored)
+// locally, or the instance's /tmp on read-only hosts like Vercel (see
+// lib/storage.ts). Deliberately not a database since this project has no DB
+// dependency and this is primarily a local/Railway tool.
 //
 // SECURITY: access tokens are server-side only. The client never receives a
 // full token — publicAccount() masks it before it leaves the server.
@@ -15,6 +17,7 @@ import fs from "fs/promises";
 import path from "path";
 import crypto from "crypto";
 import { listChannels, listOrganizations } from "./buffer";
+import { getStore } from "./storage";
 
 export interface BufferAccount {
   id: string;
@@ -24,16 +27,22 @@ export interface BufferAccount {
   addedAt: string; // ISO timestamp
 }
 
-const DATA_DIR = path.join(process.cwd(), "data");
-const ACCOUNTS_FILE = path.join(DATA_DIR, "accounts.json");
+// Where accounts.json lives on this host (resolved per call — cheap, and
+// correct across cold starts that might land on different filesystems).
+function storePaths(): { file: string; note: string | null } {
+  const s = getStore();
+  return { file: path.join(s.dir, "accounts.json"), note: s.note };
+}
 
-async function ensureStore(): Promise<void> {
-  await fs.mkdir(DATA_DIR, { recursive: true });
+/** Why storage behaves differently on this host (null = normal local disk).
+ *  Surfaced by /api/accounts so the UI can warn Vercel users. */
+export function accountsStorageNote(): string | null {
+  return getStore().note;
 }
 
 async function readAll(): Promise<BufferAccount[]> {
   try {
-    const raw = await fs.readFile(ACCOUNTS_FILE, "utf-8");
+    const raw = await fs.readFile(storePaths().file, "utf-8");
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed.accounts) ? parsed.accounts : [];
   } catch {
@@ -43,8 +52,18 @@ async function readAll(): Promise<BufferAccount[]> {
 }
 
 async function writeAll(accounts: BufferAccount[]): Promise<void> {
-  await ensureStore();
-  await fs.writeFile(ACCOUNTS_FILE, JSON.stringify({ accounts }, null, 2), "utf-8");
+  const { file } = storePaths();
+  try {
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, JSON.stringify({ accounts }, null, 2), "utf-8");
+  } catch (err: any) {
+    throw new Error(
+      `Couldn't save the account on this host (${err?.code ?? err?.message ?? err}). ` +
+        "The filesystem looks read-only (typical on Vercel). Instead of adding " +
+        "it here, set BUFFER_ACCESS_TOKEN (+ optional BUFFER_ORGANIZATION_ID) in " +
+        "your host's Environment Variables — the app shows it as the Default account."
+    );
+  }
 }
 
 /**
