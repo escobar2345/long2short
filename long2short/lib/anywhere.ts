@@ -110,8 +110,59 @@ function boxRestrictedError(): Error {
       "reports it as password-protected or restricted to the file owner's " +
       "organization, so no downloader can fetch it without those credentials. " +
       "If you can open it in your browser, download the video there and paste " +
-      "a direct .mp4/.webm link instead. Public Box links (\"anyone with the " +
+      "the saved file's path (e.g. C:\\Users\\you\\Downloads\\video.mp4) or a " +
+      "direct .mp4/.webm link instead. Public Box links (\"anyone with the " +
       "link\" sharing) download automatically."
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Box's TEMPORARY signed download links (public.boxcloud.com)          */
+/*                                                                      */
+/* Shape: https://public.boxcloud.com/d/1/b1!<token>/download. This is  */
+/* what Box hands your BROWSER when you click "Download" on a Box file. */
+/* The tokens are single-use and expire within minutes, so by the time  */
+/* one is pasted here it has usually already been consumed or expired   */
+/* (Box answers 400/403). We still try a fresh one, but failures get a  */
+/* specific message instead of "unsupported site".                      */
+/* ------------------------------------------------------------------ */
+
+export function isBoxCloudUrl(url: string): boolean {
+  return /boxcloud\.com/i.test(url);
+}
+
+function boxCloudExpiredError(status: number): Error {
+  return new Error(
+    "This is Box's TEMPORARY signed download link (public.boxcloud.com) — " +
+      "those tokens are single-use and expire within minutes" +
+      (status ? ` (Box just answered HTTP ${status})` : "") +
+      ". Download the video in your browser instead, then paste the saved " +
+      "file's path (e.g. C:\\Users\\you\\Downloads\\video.mp4) or the Box " +
+      "share page link (…box.com/s/…). Local file paths and public Box " +
+      "share links are both supported."
+  );
+}
+
+/** True when the string is a local file path (Windows drive/UNC or unix
+ *  absolute) rather than a URL — lets users paste a downloaded file. */
+export function isLocalFilePath(s: string): boolean {
+  const t = s.trim().replace(/^["']|["']$/g, "");
+  return (
+    /^[a-zA-Z]:[\\/]/.test(t) || // C:\ or C:/
+    /^\\\\/.test(t) || // UNC \\server\share
+    (t.startsWith("/") && !/^https?:\/\//i.test(t)) // /Users/... /home/...
+  );
+}
+
+/** Strips quotes + normalizes a pasted local path. */
+function normalizeLocalPath(s: string): string {
+  return path.normalize(s.trim().replace(/^["']|["']$/g, ""));
+}
+
+function notVideoFileError(p: string): Error {
+  return new Error(
+    `"${path.basename(p)}" doesn't look like a video file — paste an ` +
+      ".mp4/.mov/.m4v/.webm/.mkv/.avi/.mpg/.ts path."
   );
 }
 
@@ -292,6 +343,33 @@ export async function probeMetadata(
     // null → fall through to yt-dlp (best effort) for odd cases
   }
 
+  // Box's temporary signed download links: try it live (a JUST-copied token
+  // can still be valid) — a dead one gets the specific expired-token error.
+  if (isBoxCloudUrl(url)) {
+    try {
+      const res = await withRetry(
+        () => fetch(url, { headers: { Range: "bytes=0-0" }, redirect: "follow" }),
+        1
+      );
+      if (!res.ok) throw boxCloudExpiredError(res.status);
+      return { title: "Box download", durationSec: ffprobeUrlDuration(url) };
+    } catch (err: any) {
+      if (err instanceof Error && /TEMPORARY signed download link/.test(err.message)) throw err;
+      throw boxCloudExpiredError(0);
+    }
+  }
+
+  // Local file paths (C:\...\video.mp4, /home/.../video.mp4): read straight
+  // off the disk — no network, no yt-dlp.
+  if (isLocalFilePath(url)) {
+    const p = normalizeLocalPath(url);
+    if (!fs.existsSync(p)) {
+      throw new Error(`File not found: ${p}`);
+    }
+    if (!VIDEO_EXT.test(p)) throw notVideoFileError(p);
+    return { title: path.basename(p), durationSec: ffprobeDuration(p) || undefined };
+  }
+
   try {
     const stdout = await ytDlpRun(["--no-warnings", "--dump-single-json"], url, 90_000);
     const j = JSON.parse(stdout);
@@ -353,6 +431,49 @@ export async function ensureVideoFileAnyUrl(url: string): Promise<AnyUrlResult> 
         meta.durationSec && meta.durationSec > 0
           ? meta.durationSec
           : ffprobeDuration(finalPath),
+    };
+  }
+
+  // Box's temporary signed download links (public.boxcloud.com/d/1/b1!…):
+  // try it live — a JUST-copied token can still work; a dead one gets the
+  // specific expired-token error instead of a generic yt-dlp failure.
+  if (isBoxCloudUrl(url)) {
+    try {
+      const res = await withRetry(() => fetch(url, { redirect: "follow" }), 1);
+      const ct = String(res.headers.get("content-type") ?? "");
+      if (!res.ok || !res.body || /text\/html/i.test(ct)) {
+        throw boxCloudExpiredError(res.status);
+      }
+      const tmp = `${finalPath}.part`;
+      await pipeline(Readable.fromWeb(res.body as any), fs.createWriteStream(tmp));
+      fs.renameSync(tmp, finalPath);
+    } catch (err: any) {
+      if (err instanceof Error && /TEMPORARY signed download link/.test(err.message)) throw err;
+      throw boxCloudExpiredError(0);
+    }
+    if (!fs.existsSync(finalPath) || fs.statSync(finalPath).size < 100_000) {
+      throw boxCloudExpiredError(0);
+    }
+    return {
+      fileUrl: localFileUrl(relPath),
+      transcript: [], // signed-link downloads carry no caption sidecars
+      title: "Box download",
+      durationSec: ffprobeDuration(finalPath),
+    };
+  }
+
+  // Local file paths (C:\...\video.mp4): copy straight off the disk —
+  // no network, no yt-dlp.
+  if (isLocalFilePath(url)) {
+    const src = normalizeLocalPath(url);
+    if (!fs.existsSync(src)) throw new Error(`File not found: ${src}`);
+    if (!VIDEO_EXT.test(src)) throw notVideoFileError(src);
+    fs.copyFileSync(src, finalPath);
+    return {
+      fileUrl: localFileUrl(relPath),
+      transcript: [],
+      title: path.basename(src),
+      durationSec: ffprobeDuration(finalPath),
     };
   }
 

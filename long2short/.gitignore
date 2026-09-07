@@ -6,3 +6,6 @@ data/
 
 # downloaded source videos (54MB+), never commit
 public/uploads
+
+# typescript incremental build cache
+tscconfig.tsbuildinfo
