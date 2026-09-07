@@ -1,0 +1,9 @@
+HTTP 200
+HOMEPAGE OK: found LONG2SHORT branding
+port 3000 LISTENING pid=6452
+
+ ✓ Starting...
+ ✓ Ready in 382.2s
+ ○ Compiling / ...
+ ✓ Compiled / in 35.3s (448 modules)
+ GET / 200 in 38644ms

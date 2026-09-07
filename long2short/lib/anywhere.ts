@@ -1,0 +1,171 @@
+import crypto from "crypto";
+import fs from "fs";
+import path from "path";
+import { execFile, execFileSync } from "child_process";
+import { promisify } from "util";
+import { localFileUrl, remuxIfNeeded } from "./youtube";
+import { parseSubtitleText } from "./subtitles";
+import type { TranscriptWord } from "./types";
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * "Download from anywhere" engine — the real thing apps like BlackHole wrap
+ * is yt-dlp, which supports 1000+ sites (TikTok, Instagram, Facebook, X,
+ * Vimeo, Reddit, Twitch VODs, direct .mp4 links …). This module drives the
+ * locally installed yt-dlp for arbitrary URLs and harvests subtitles for the
+ * transcript, so the whole long2short pipeline works beyond YouTube.
+ */
+
+export function isYouTubeUrl(url: string): boolean {
+  return /(?:^|\.)youtube\.com|youtu\.be/i.test(url);
+}
+
+/** Stable, filesystem-safe cache key for any URL. */
+function slugFor(url: string): string {
+  return "any-" + crypto.createHash("sha1").update(url).digest("hex").slice(0, 12);
+}
+
+function uploadsDir(): string {
+  const dir = path.join(process.cwd(), "public", "uploads");
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/** Local-file duration via ffprobe. Direct-file CDNs (and some platforms)
+ *  don't expose duration in metadata — without this, the edit-plan fallback
+ *  would assume 600s and cut clip windows past the end of the real video. */
+function ffprobeDuration(file: string): number {
+  try {
+    const out = execFileSync(
+      "ffprobe",
+      [
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        file,
+      ],
+      { windowsHide: true, timeout: 30_000 }
+    );
+    const d = parseFloat(String(out).trim());
+    return Number.isFinite(d) ? Math.round(d) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Quick metadata probe (no download). Fails soft — callers treat as optional. */
+export async function probeMetadata(
+  url: string
+): Promise<{ title?: string; durationSec?: number }> {
+  try {
+    const { stdout } = await execFileAsync(
+      "yt-dlp",
+      ["--no-playlist", "--no-warnings", "--dump-single-json", url],
+      { timeout: 90_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true }
+    );
+    const j = JSON.parse(stdout);
+    return {
+      title: typeof j.title === "string" ? j.title : undefined,
+      durationSec: Number.isFinite(j.duration) ? Math.round(j.duration) : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+/** Finds and parses the subtitle file yt-dlp wrote next to the video. */
+function readSubtitles(dir: string, slug: string): TranscriptWord[] {
+  if (!fs.existsSync(dir)) return [];
+  const files = fs.readdirSync(dir).filter((f) => f.startsWith(slug + ".") && /\.(vtt|srt)$/i.test(f));
+  const pick =
+    files.find((f) => /^\.?en\b/i.test(f.slice(slug.length))) ?? // slug.en.vtt
+    files.find((f) => /en/i.test(f)) ??
+    files[0];
+  if (!pick) return [];
+  try {
+    return parseSubtitleText(fs.readFileSync(path.join(dir, pick), "utf8"));
+  } catch {
+    return [];
+  }
+}
+
+export interface AnyUrlResult {
+  fileUrl: string;
+  transcript: TranscriptWord[];
+  title?: string;
+  durationSec?: number;
+}
+
+/**
+ * Downloads ANY video URL via yt-dlp (capped at 720p — Remotion outputs
+ * 1080x1920 portrait, so 720p source is plenty), remuxes to mp4, and harvests
+ * subtitle tracks (auto-subs included) into a word-level transcript.
+ *
+ * Note: some platforms (Instagram/TikTok) occasionally require cookies or
+ * login; when yt-dlp fails the error message tells the user why.
+ */
+export async function ensureVideoFileAnyUrl(url: string): Promise<AnyUrlResult> {
+  const slug = slugFor(url);
+  const dir = uploadsDir();
+  const finalPath = path.join(dir, `${slug}.mp4`);
+  const relPath = `/uploads/${slug}.mp4`;
+
+  if (fs.existsSync(finalPath) && fs.statSync(finalPath).size > 100_000) {
+    const meta = await probeMetadata(url);
+    return {
+      fileUrl: localFileUrl(relPath),
+      transcript: readSubtitles(dir, slug),
+      title: meta.title,
+      durationSec:
+        meta.durationSec && meta.durationSec > 0
+          ? meta.durationSec
+          : ffprobeDuration(finalPath),
+    };
+  }
+
+  // --write-auto-subs + --convert-subs: get caption tracks wherever the site
+  // offers them (TikTok/Instagram/Facebook/X auto-captions are common).
+  try {
+    await execFileAsync(
+      "yt-dlp",
+      [
+        "--no-playlist",
+        "-f", "bv*[height<=720]+ba/b[height<=720]/b",
+        "--merge-output-format", "mp4",
+        "--no-part",
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-langs", "en.*,en",
+        "--sub-format", "vtt/srt/best",
+        "--convert-subs", "vtt",
+        "-o", path.join(dir, `${slug}.%(ext)s`),
+        url,
+      ],
+      { timeout: 300_000, maxBuffer: 8 * 1024 * 1024, windowsHide: true }
+    );
+  } catch (err: any) {
+    const detail = String(err?.stderr ?? err?.message ?? err).slice(-400).trim();
+    throw new Error(
+      `yt-dlp could not download this URL${
+        detail ? `: ${detail}` : ""
+      } — some platforms require cookies/login, and private or deleted videos cannot be fetched.`
+    );
+  }
+
+  remuxIfNeeded(dir, slug);
+  if (!fs.existsSync(finalPath) || fs.statSync(finalPath).size < 100_000) {
+    throw new Error("yt-dlp ran but produced no usable video file for this URL");
+  }
+
+  const meta = await probeMetadata(url);
+  return {
+    fileUrl: localFileUrl(relPath),
+    transcript: readSubtitles(dir, slug),
+    title: meta.title,
+    durationSec:
+      meta.durationSec && meta.durationSec > 0
+        ? meta.durationSec
+        : ffprobeDuration(finalPath),
+  };
+}

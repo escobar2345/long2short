@@ -1,0 +1,8 @@
+node_modules
+.next
+public/renders
+.env.local
+data/
+
+# downloaded source videos (54MB+), never commit
+public/uploads
