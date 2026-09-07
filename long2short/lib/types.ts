@@ -77,6 +77,9 @@ export interface ClipPlan {
 
 export interface EditPlan {
   sourceVideoPath: string;
+  // The original link (YouTube or any platform) — lets /api/render fetch the
+  // video file lazily when analyze was metadata-only (videoFilePath === "").
+  sourceUrl?: string;
   clips: ClipPlan[];
 }
 

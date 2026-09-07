@@ -104,6 +104,9 @@ export default function Page() {
   const [maxSec, setMaxSec] = useState(60);
 
   const [intel, setIntel] = useState<VideoIntel | null>(null);
+  // True when analyze returned metadata but the video FILE still needs to be
+  // downloaded (that happens lazily at render time — see /api/render).
+  const [filePending, setFilePending] = useState(false);
   const [styleProfile, setStyleProfile] = useState<StyleProfile | null>(null);
   const [editPlan, setEditPlan] = useState<EditPlan | null>(null);
   const [renderedUrls, setRenderedUrls] = useState<Record<number, string>>({});
@@ -221,23 +224,50 @@ export default function Page() {
       });
   }, []);
 
-  async function callApi(url: string, body: any) {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error ?? "Request failed");
-    return data;
+  // Every API call gets a hard client-side timeout so the UI can never spin
+  // forever (the original "stuck on Fetching…" bug): analyze ~2.5min (Apify
+  // actor run), plan ~2min (GLM), render 10min (download + Remotion render).
+  async function callApi(url: string, body: any, timeoutMs = 120_000) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Request failed");
+      return data;
+    } catch (e: any) {
+      if (e?.name === "AbortError") {
+        throw new Error(
+          `The server did not respond within ${Math.round(timeoutMs / 1000)}s. ` +
+            `Check the dev-server log, then try again — if this keeps happening ` +
+            `the step may be failing on the server before it can reply.`
+        );
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async function handleAnalyze() {
     setError(null);
     setLoading("analyze");
     try {
-      const data = await callApi("/api/analyze", { youtubeUrl, url: youtubeUrl });
+      const data = await callApi(
+        "/api/analyze",
+        { youtubeUrl, url: youtubeUrl },
+        150_000
+      );
       setIntel(data.intel);
+      // Analyze is metadata-only — the actual video file downloads lazily at
+      // render time. Tell the user so the render step's extra wait isn't a
+      // surprise.
+      setFilePending(Boolean(data.videoFilePending));
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -311,11 +341,15 @@ export default function Page() {
     setError(null);
     setLoading(`render-${clipIndex}`);
     try {
-      const data = await callApi("/api/render", {
-        editPlan,
-        clipIndex,
-        sourceUrl: intel?.sourceUrl ?? "",
-      });
+      const data = await callApi(
+        "/api/render",
+        {
+          editPlan,
+          clipIndex,
+          sourceUrl: intel?.sourceUrl ?? "",
+        },
+        600_000
+      );
       setRenderedUrls((prev) => ({ ...prev, [clipIndex]: data.url }));
       refreshRenders();
       setCaption((prev) => ({
@@ -430,12 +464,21 @@ export default function Page() {
             disabled={loading === "analyze" || !youtubeUrl}
             onClick={handleAnalyze}
           >
-            {loading === "analyze" ? "Fetching…" : "Analyze video"}
+            {loading === "analyze"
+              ? "Fetching metadata… (usually 15–60s)"
+              : "Analyze video"}
           </button>
         </div>
         {intel && (
           <div style={{ marginTop: 12, fontSize: 13, color: "#8A8D93" }}>
             Loaded "{intel.title}" — {Math.round(intel.durationSec)}s, {intel.transcript.length} transcript words.
+            {filePending && (
+              <div style={{ marginTop: 6, fontSize: 12, color: "#8A8D93" }}>
+                ✔ Metadata loaded. The video file downloads automatically when you
+                render a clip (first render for a video takes a few extra minutes
+                because of the download; after that it's cached).
+              </div>
+            )}
           </div>
         )}
       </section>
@@ -607,7 +650,9 @@ export default function Page() {
                 disabled={loading === `render-${i}`}
                 onClick={() => handleRender(i)}
               >
-                {loading === `render-${i}` ? "Rendering…" : "Render clip"}
+                {loading === `render-${i}`
+                  ? "Downloading source + rendering… (3–8 min, don't close)"
+                  : "Render clip"}
               </button>
               {renderedUrls[i] && (
                 <>

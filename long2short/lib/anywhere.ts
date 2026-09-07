@@ -28,7 +28,13 @@ function slugFor(url: string): string {
 
 function uploadsDir(): string {
   const dir = path.join(process.cwd(), "public", "uploads");
-  fs.mkdirSync(dir, { recursive: true });
+  // Read-only filesystems (Vercel): don't crash the caller — caption writes
+  // simply won't persist there; metadata analysis still works.
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch {
+    /* ignore */
+  }
   return dir;
 }
 
@@ -168,4 +174,49 @@ export async function ensureVideoFileAnyUrl(url: string): Promise<AnyUrlResult> 
         ? meta.durationSec
         : ffprobeDuration(finalPath),
   };
+}
+
+/**
+ * Fast, download-free analysis for ANY url: yt-dlp metadata probe + caption
+ * track harvest (--skip-download). Runs in seconds, so /api/analyze never
+ * stalls on a multi-hundred-MB download — the video FILE is fetched lazily
+ * by /api/render right before Remotion needs the pixels.
+ */
+export async function analyzeAnyUrl(url: string): Promise<{
+  title?: string;
+  durationSec?: number;
+  transcript: TranscriptWord[];
+}> {
+  const meta = await probeMetadata(url);
+  if (!meta.title && !meta.durationSec) {
+    throw new Error(
+      "Could not read this link's metadata — it may be private, region-locked " +
+        "or from an unsupported site. Direct .mp4/.webm links and major " +
+        "platforms (TikTok, Instagram, X, Vimeo, Facebook) work best."
+    );
+  }
+  const slug = slugFor(url);
+  const dir = uploadsDir();
+  let transcript: TranscriptWord[] = [];
+  try {
+    await execFileAsync(
+      "yt-dlp",
+      [
+        "--no-playlist",
+        "--skip-download",
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-langs", "en.*,en",
+        "--sub-format", "vtt/srt/best",
+        "--convert-subs", "vtt",
+        "-o", path.join(dir, `${slug}.%(ext)s`),
+        url,
+      ],
+      { timeout: 120_000, maxBuffer: 8 * 1024 * 1024, windowsHide: true }
+    );
+    transcript = readSubtitles(dir, slug);
+  } catch {
+    // captions are best-effort; metadata is the critical part
+  }
+  return { title: meta.title, durationSec: meta.durationSec, transcript };
 }

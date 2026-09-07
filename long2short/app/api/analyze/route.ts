@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { fetchVideoIntel } from "../../../lib/apify";
-import { ensureVideoFile } from "../../../lib/youtube";
-import { ensureVideoFileAnyUrl, isYouTubeUrl } from "../../../lib/anywhere";
+import { analyzeAnyUrl, isYouTubeUrl } from "../../../lib/anywhere";
 import type { VideoIntel } from "../../../lib/types";
 
-// Apify runs + the video download can take minutes on a slow link.
+// Metadata + transcript only (fast). The heavy video-file download happens
+// lazily in /api/render right before Remotion needs the pixels — this keeps
+// analyze inside serverless timeouts (Vercel caps at 60s on Hobby).
 export const runtime = "nodejs";
 export const maxDuration = 300;
 
@@ -16,45 +17,29 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "url is required" }, { status: 400 });
     }
 
-    // ANY platform (TikTok, Instagram, Facebook, X, Vimeo, direct mp4, …):
-    // yt-dlp handles 1000+ sites and also harvests caption tracks for the
-    // transcript. No Apify needed on this path.
+    let intel: VideoIntel;
     if (!isYouTubeUrl(url)) {
-      const info = await ensureVideoFileAnyUrl(url);
-      const intel: VideoIntel = {
+      // ANY platform (TikTok, Instagram, Facebook, X, Vimeo, direct mp4, …):
+      // yt-dlp metadata probe + caption harvest. No download, no Apify.
+      const info = await analyzeAnyUrl(url);
+      intel = {
         sourceUrl: url,
         title: info.title ?? "Untitled",
         durationSec: info.durationSec ?? 0,
-        videoFilePath: info.fileUrl,
+        videoFilePath: "",
         transcript: info.transcript,
       };
-      return NextResponse.json({ intel });
+    } else {
+      // YouTube path: Apify gives rich metadata + transcript.
+      intel = await fetchVideoIntel(url);
     }
 
-    // YouTube path: Apify gives rich metadata + transcript; the video file
-    // itself comes from yt-dlp / the Apify downloader fallback.
-    const intel = await fetchVideoIntel(url);
-
-    // Remotion cuts real pixels, not text — resolve an actual downloadable
-    // video file (yt-dlp first, Apify downloader actor as fallback). If this
-    // fails we still hand the metadata back so the UI shows what we DID get.
-    if (!intel.videoFilePath) {
-      try {
-        intel.videoFilePath = await ensureVideoFile(url);
-      } catch (err: any) {
-        return NextResponse.json(
-          {
-            error:
-              `Metadata came back, but getting the actual video file failed: ` +
-              `${err.message ?? err}`,
-            intel,
-          },
-          { status: 502 }
-        );
-      }
-    }
-
-    return NextResponse.json({ intel });
+    return NextResponse.json({
+      intel,
+      // The actual video FILE is fetched at render time (cached, so it's
+      // downloaded exactly once per video).
+      videoFilePending: !intel.videoFilePath,
+    });
   } catch (err: any) {
     return NextResponse.json({ error: err.message ?? "Analyze failed" }, { status: 500 });
   }

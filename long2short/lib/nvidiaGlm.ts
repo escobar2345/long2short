@@ -97,6 +97,7 @@ export async function generateEditPlan(
 
   return {
     sourceVideoPath: intel.videoFilePath,
+    sourceUrl: intel.sourceUrl,
     clips: parsed.clips ?? [],
   };
 }
@@ -350,5 +351,5 @@ async function buildVisualPlan(
     }
   });
 
-  return { sourceVideoPath: intel.videoFilePath, clips };
+  return { sourceVideoPath: intel.videoFilePath, sourceUrl: intel.sourceUrl, clips };
 }
