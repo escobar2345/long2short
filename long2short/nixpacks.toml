@@ -1,0 +1,6 @@
+# Railway/Nixpacks config — the visual scene-scan (lib/ffmpegFrames.ts) shells
+# out to the `ffmpeg` binary, which is not in Railway's default builder image.
+# This installs it before the Next.js build. Keep this file at the service's
+# configured Root Directory (the long2short app folder).
+[phases.setup]
+nixPkgs = ["ffmpeg"]
