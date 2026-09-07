@@ -9,3 +9,6 @@ public/uploads
 
 # typescript incremental build cache
 tscconfig.tsbuildinfo
+
+# TS incremental build cache
+tsconfig.tsbuildinfo
