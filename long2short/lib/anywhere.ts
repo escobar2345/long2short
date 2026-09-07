@@ -38,6 +38,84 @@ function uploadsDir(): string {
   return dir;
 }
 
+/** Detects a readable browser cookie jar. Firefox wins: its cookies.sqlite is
+ *  NOT encrypted and is readable even while Firefox is open. Edge/Chrome DBs
+ *  are usually locked while the browser runs (yt-dlp #7271) and recent builds
+ *  add app-bound encryption yt-dlp cannot open — so they're skipped. */
+function cookieBrowserArgs(): string[] {
+  try {
+    const ffRoot = path.join(process.env.APPDATA ?? "", "Mozilla", "Firefox", "Profiles");
+    if (
+      fs.existsSync(ffRoot) &&
+      fs.readdirSync(ffRoot).some((p) =>
+        fs.existsSync(path.join(ffRoot, p, "cookies.sqlite"))
+      )
+    ) {
+      return ["--cookies-from-browser", "firefox"];
+    }
+  } catch {
+    /* ignore */
+  }
+  return [];
+}
+
+/**
+ * Runs yt-dlp with a cookie fallback in BOTH directions: a login-walled site
+ * (X, Facebook…) fails anonymously when cookies are available, and a locked
+ * or mid-write cookie jar can fail a run that would succeed anonymously.
+ * `baseArgs` must NOT contain the url — it is always appended last.
+ */
+async function ytDlpRun(
+  baseArgs: string[],
+  url: string,
+  timeoutMs: number
+): Promise<string> {
+  const cookies = cookieBrowserArgs();
+  const attempt = (extra: string[]) =>
+    execFileAsync(
+      "yt-dlp",
+      ["--no-playlist", ...extra, ...baseArgs, url],
+      { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, windowsHide: true }
+    );
+  try {
+    return (await attempt(cookies)).stdout;
+  } catch (err: any) {
+    const stderr = String(err?.stderr ?? err?.message ?? "");
+    // Diagnose in the server log: was the cookie jar even available, and what
+    // did yt-dlp actually say? (probeMetadata callers swallow these errors.)
+    console.error(
+      `[anywhere] yt-dlp failed (cookies=${cookies.length ? "firefox" : "none"}): ` +
+        stderr.slice(-400)
+    );
+    if (!cookies.length) throw err;
+    if (/sign in|log ?in|cookies|age.restricted|private|members/i.test(stderr)) throw err;
+    // Cookie jar itself may be the problem — retry anonymously.
+    try {
+      return (await attempt([])).stdout;
+    } catch (err2: any) {
+      console.error(
+        `[anywhere] yt-dlp anonymous retry also failed: ` +
+          String(err2?.stderr ?? err2?.message ?? "").slice(-400)
+      );
+      throw err2;
+    }
+  }
+}
+
+/** Turns raw yt-dlp stderr into something a human can act on. */
+export function humanizeYtDlpError(stderr: string): string {
+  const s = stderr.slice(-600);
+  if (/no video could be found/i.test(s))
+    return "this post contains no video (text-only post).";
+  if (/sign in|log ?in to confirm|login|cookies|age.restricted|private video|members/i.test(s))
+    return "this link needs a logged-in session — sign in to the site once in Firefox on this PC and try again (the downloader reuses your Firefox cookies automatically).";
+  if (/unsupported url/i.test(s))
+    return "this site isn't supported. Direct .mp4/.webm links, YouTube, TikTok, Instagram, X, Facebook, Vimeo, Reddit and Twitch work best.";
+  if (/http error 4\d\d|404|410/i.test(s))
+    return "the site refused this request — the post may be private, deleted or region-locked.";
+  return "";
+}
+
 /** Local-file duration via ffprobe. Direct-file CDNs (and some platforms)
  *  don't expose duration in metadata — without this, the edit-plan fallback
  *  would assume 600s and cut clip windows past the end of the real video. */
@@ -60,23 +138,24 @@ function ffprobeDuration(file: string): number {
   }
 }
 
-/** Quick metadata probe (no download). Fails soft — callers treat as optional. */
+/** Quick metadata probe (no download). Fails soft — callers treat as optional.
+ *  On failure the raw stderr tail is returned as `errorDetail` so callers can
+ *  show the REAL reason (login wall, no video, unsupported site…) instead of
+ *  a generic guess. */
 export async function probeMetadata(
   url: string
-): Promise<{ title?: string; durationSec?: number }> {
+): Promise<{ title?: string; durationSec?: number; errorDetail?: string }> {
   try {
-    const { stdout } = await execFileAsync(
-      "yt-dlp",
-      ["--no-playlist", "--no-warnings", "--dump-single-json", url],
-      { timeout: 90_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true }
-    );
+    const stdout = await ytDlpRun(["--no-warnings", "--dump-single-json"], url, 90_000);
     const j = JSON.parse(stdout);
     return {
       title: typeof j.title === "string" ? j.title : undefined,
       durationSec: Number.isFinite(j.duration) ? Math.round(j.duration) : undefined,
     };
-  } catch {
-    return {};
+  } catch (err: any) {
+    const stderr = String(err?.stderr ?? err?.message ?? err);
+    console.error(`[anywhere] probeMetadata failed for ${url}: ${stderr.slice(-500)}`);
+    return { errorDetail: stderr.slice(-600) };
   }
 }
 
@@ -133,10 +212,8 @@ export async function ensureVideoFileAnyUrl(url: string): Promise<AnyUrlResult> 
   // --write-auto-subs + --convert-subs: get caption tracks wherever the site
   // offers them (TikTok/Instagram/Facebook/X auto-captions are common).
   try {
-    await execFileAsync(
-      "yt-dlp",
+    await ytDlpRun(
       [
-        "--no-playlist",
         "-f", "bv*[height<=720]+ba/b[height<=720]/b",
         "--merge-output-format", "mp4",
         "--no-part",
@@ -146,16 +223,15 @@ export async function ensureVideoFileAnyUrl(url: string): Promise<AnyUrlResult> 
         "--sub-format", "vtt/srt/best",
         "--convert-subs", "vtt",
         "-o", path.join(dir, `${slug}.%(ext)s`),
-        url,
       ],
-      { timeout: 300_000, maxBuffer: 8 * 1024 * 1024, windowsHide: true }
+      url,
+      300_000
     );
   } catch (err: any) {
-    const detail = String(err?.stderr ?? err?.message ?? err).slice(-400).trim();
+    const raw = String(err?.stderr ?? err?.message ?? err);
+    const detail = humanizeYtDlpError(raw) || raw.slice(-300).trim();
     throw new Error(
-      `yt-dlp could not download this URL${
-        detail ? `: ${detail}` : ""
-      } — some platforms require cookies/login, and private or deleted videos cannot be fetched.`
+      `Could not download this URL${detail ? ` — ${detail}` : ""}`
     );
   }
 
@@ -189,20 +265,26 @@ export async function analyzeAnyUrl(url: string): Promise<{
 }> {
   const meta = await probeMetadata(url);
   if (!meta.title && !meta.durationSec) {
+    // Surface yt-dlp's actual reason (login wall / no video in post /
+    // unsupported site / 404) instead of a vague catch-all.
+    const reason = meta.errorDetail ? humanizeYtDlpError(meta.errorDetail) : "";
     throw new Error(
-      "Could not read this link's metadata — it may be private, region-locked " +
-        "or from an unsupported site. Direct .mp4/.webm links and major " +
-        "platforms (TikTok, Instagram, X, Vimeo, Facebook) work best."
+      "Could not read this link's metadata" +
+        (reason
+          ? ` — ${reason}`
+          : " — it may be private, region-locked, text-only, or from an " +
+            "unsupported site. If it's from X or Facebook, sign in to the site " +
+            "once in Firefox on this PC and retry (your Firefox session is " +
+            "reused automatically). Direct .mp4/.webm links and " +
+            "TikTok/Instagram/YouTube work without any login.")
     );
   }
   const slug = slugFor(url);
   const dir = uploadsDir();
   let transcript: TranscriptWord[] = [];
   try {
-    await execFileAsync(
-      "yt-dlp",
+    await ytDlpRun(
       [
-        "--no-playlist",
         "--skip-download",
         "--write-subs",
         "--write-auto-subs",
@@ -210,9 +292,9 @@ export async function analyzeAnyUrl(url: string): Promise<{
         "--sub-format", "vtt/srt/best",
         "--convert-subs", "vtt",
         "-o", path.join(dir, `${slug}.%(ext)s`),
-        url,
       ],
-      { timeout: 120_000, maxBuffer: 8 * 1024 * 1024, windowsHide: true }
+      url,
+      120_000
     );
     transcript = readSubtitles(dir, slug);
   } catch {
