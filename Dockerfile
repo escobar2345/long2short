@@ -8,7 +8,7 @@ WORKDIR /app
 # Install ffmpeg (required for lib/ffmpegFrames.ts)
 RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
-COPY package.json package-lock.json ./
+COPY long2short/package.json long2short/package-lock.json ./
 RUN npm ci
 
 # Stage 2: Builder
@@ -19,7 +19,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 COPY --from=deps /app/node_modules ./node_modules
-COPY . .
+COPY long2short/ ./
 
 # Build the Next.js application
 RUN npm run build
