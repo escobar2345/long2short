@@ -21,6 +21,11 @@ RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 COPY --from=deps /app/node_modules ./node_modules
 COPY long2short/ ./
 
+# Always ensure the public dir exists in the image — Fly's builder builds from
+# the git checkout, and public/renders|uploads are gitignored (runtime data),
+# so the folder would be missing without this.
+RUN mkdir -p public/renders public/uploads
+
 # Build the Next.js application
 RUN npm run build
 

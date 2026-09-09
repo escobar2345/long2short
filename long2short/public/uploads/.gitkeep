@@ -1,0 +1,2 @@
+# Keep this folder in git so Fly.io's builder sees /app/public at build time.
+# Uploaded source videos are still ignored via .gitignore.

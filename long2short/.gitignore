@@ -1,11 +1,13 @@
 node_modules
 .next
-public/renders
+public/renders/*
+!public/renders/.gitkeep
 .env.local
 data/
 
 # downloaded source videos (54MB+), never commit
-public/uploads
+public/uploads/*
+!public/uploads/.gitkeep
 
 # typescript incremental build cache
 
