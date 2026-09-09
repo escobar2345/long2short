@@ -1,0 +1,33 @@
+# Fly.io configuration for long2short
+# Run `flyctl launch` or `flyctl deploy` from this directory
+
+app = "long2short"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  NEXT_TELEMETRY_DISABLED = "1"
+  # Set these with `flyctl secrets set`:
+  # NEXT_PUBLIC_BASE_URL = "https://your-app.fly.dev"
+  # Add your other env vars from .env.local
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 2048
+
+# Optional: Add a volume for persistent renders if needed
+# [mounts]
+#   source = "renders_data"
+#   destination = "/app/public/renders"
