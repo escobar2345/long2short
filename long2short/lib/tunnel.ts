@@ -213,6 +213,10 @@ async function spawnNgrokIfNeeded(port: number): Promise<string> {
   ];
   const token = process.env.NGROK_AUTHTOKEN?.trim();
   if (token) args.push(`--authtoken=${token}`);
+  // Optional reserved static domain (one free per ngrok account) — keeps the
+  // same public URL across restarts, which scheduled Buffer posts need.
+  const domain = process.env.NGROK_DOMAIN?.trim();
+  if (domain) args.push(`--domain=${domain}`);
 
   const child = spawn(bin, args, {
     stdio: ["ignore", "pipe", "pipe"],
