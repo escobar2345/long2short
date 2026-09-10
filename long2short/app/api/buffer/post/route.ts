@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createVideoPost } from "../../../../lib/buffer";
 import { getAccount } from "../../../../lib/accounts";
+import { getPublicBaseUrl } from "../../../../lib/tunnel";
 
 export const runtime = "nodejs";
 
@@ -45,13 +46,17 @@ export async function POST(req: NextRequest) {
     // and that URL has to stay reachable until the post actually publishes,
     // not just at the moment you call this route. `renderedPath` is the
     // relative path returned by /api/render (e.g. "/renders/clip-0.mp4"),
-    // served from Next's /public. Set NEXT_PUBLIC_BASE_URL to your real
-    // deployed domain — this will NOT work against localhost, since Buffer's
-    // servers need to reach it over the public internet.
-    const baseUrl = process.env.NEXT_PUBLIC_BASE_URL;
-    if (!baseUrl) {
+    // served from Next's /public. getPublicBaseUrl() makes the app come
+    // online BY ITSELF: it trusts NEXT_PUBLIC_BASE_URL when the video answers
+    // through it (the production path — Fly.io/Vercel/etc.), otherwise it
+    // spins up / reuses an ngrok tunnel so local dev works and Buffer never
+    // sees a localhost URL.
+    let baseUrl: string;
+    try {
+      baseUrl = await getPublicBaseUrl(renderedPath);
+    } catch (err: any) {
       return NextResponse.json(
-        { error: "NEXT_PUBLIC_BASE_URL is not set — Buffer needs a publicly reachable URL for the video" },
+        { error: err.message ?? "No public URL is available for the video" },
         { status: 500 }
       );
     }
@@ -100,6 +105,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       results: settled,
+      publicBaseUrl: baseUrl,
       summary: {
         total: settled.length,
         succeeded: succeeded.length,

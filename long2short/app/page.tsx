@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect } from "react";
 import type { VideoIntel, StyleProfile, EditRules, EditPlan } from "../lib/types";
-import type { PublicAccount, AccountChannels, PostResponse } from "../lib/clientTypes";
+import type { PublicAccount, AccountChannels, PostResponse, TunnelInfo } from "../lib/clientTypes";
 import type { ConfigStatus } from "../lib/config";
 import AccountsManager from "./components/AccountsManager";
 import CaptionCoach from "./components/CaptionCoach";
@@ -59,6 +59,22 @@ const buttonDisabled: React.CSSProperties = {
   cursor: "not-allowed",
 };
 
+// Small destructive-action button (delete rendered clip / stored video).
+const dangerButton: React.CSSProperties = {
+  ...buttonStyle,
+  background: "#8C2E1F",
+  color: "#FFE1D6",
+  padding: "6px 12px",
+  fontSize: 12,
+};
+
+const dangerButtonDisabled: React.CSSProperties = {
+  ...dangerButton,
+  background: "#33211C",
+  color: "#8A6E64",
+  cursor: "not-allowed",
+};
+
 function chipStyle(checked: boolean): React.CSSProperties {
   return {
     display: "inline-flex",
@@ -80,9 +96,18 @@ type ExistingRender = {
   sizeMb: number;
   modified: string;
   sourceUrl?: string | null;
+  sourceFile?: string | null;
   sourceStartSec?: number | null;
   sourceEndSec?: number | null;
   hookTitle?: string | null;
+};
+
+// One source video file stored in public/uploads (URL downloads + uploads).
+type StoredUpload = {
+  file: string;
+  url: string;
+  sizeMb: number;
+  modified: string;
 };
 
 /** Extracts the YouTube video id from any common URL shape (for matching
@@ -95,6 +120,8 @@ function ytId(url: string | null | undefined): string {
 
 export default function Page() {
   const [youtubeUrl, setYoutubeUrl] = useState("");
+  // Step 01 alternative to pasting a URL: a video file chosen on this computer.
+  const [sourceFile, setSourceFile] = useState<File | null>(null);
   const [sampleFile, setSampleFile] = useState<File | null>(null);
   const [rulesText, setRulesText] = useState(
     "Prioritize the most quotable, self-contained moments. Keep energy high from the first second."
@@ -111,6 +138,8 @@ export default function Page() {
   const [editPlan, setEditPlan] = useState<EditPlan | null>(null);
   const [renderedUrls, setRenderedUrls] = useState<Record<number, string>>({});
   const [existingRenders, setExistingRenders] = useState<ExistingRender[]>([]);
+  // Source videos cached on this machine (public/uploads) — deletable.
+  const [storedUploads, setStoredUploads] = useState<StoredUpload[]>([]);
 
   const [accountChannels, setAccountChannels] = useState<AccountChannels[]>([]);
   const [savedAccounts, setSavedAccounts] = useState<PublicAccount[]>([]);
@@ -118,6 +147,9 @@ export default function Page() {
   // Key format: "<accountId>:<channelId>"
   const [selectedTargets, setSelectedTargets] = useState<Record<number, Record<string, boolean>>>({});
   const [caption, setCaption] = useState<Record<number, string>>({});
+  // Per clip: your free-text instructions to the AI about WHAT the post should
+  // say ("tell the AI what to post") — drafted into caption[i] before posting.
+  const [postBrief, setPostBrief] = useState<Record<number, string>>({});
   const [postMode, setPostMode] = useState<Record<number, "queue" | "schedule">>({});
   const [dueAt, setDueAt] = useState<Record<number, string>>({});
   const [postResult, setPostResult] = useState<Record<number, string>>({});
@@ -147,21 +179,39 @@ export default function Page() {
     }
   }
 
+  async function refreshUploads() {
+    try {
+      const r = await fetch("/api/uploads");
+      const d = await r.json();
+      if (Array.isArray(d.uploads)) setStoredUploads(d.uploads);
+    } catch {
+      /* stored-video list is optional at load time */
+    }
+  }
+
   useEffect(() => {
     refreshAccountsAndChannels();
     refreshRenders();
+    refreshUploads();
   }, []);
 
-  // If a render for the CURRENT video already exists on disk (matched via the
-  // render manifest by YouTube video id), surface it in the per-clip player
-  // immediately — no re-render needed. The source match prevents a stale clip
-  // from a DIFFERENT video from ever showing up or being posted here.
+  // If a render for the CURRENT video already exists on disk, surface it in the
+  // per-clip player immediately — no re-render needed. The source match prevents
+  // a stale clip from a DIFFERENT video from ever showing up or being posted.
+  // For URL videos we match on the (normalized) YouTube id; uploaded videos have
+  // no URL, so we match on the source upload-file basename instead.
   useEffect(() => {
     if (!editPlan || existingRenders.length === 0) return;
     const currentId = ytId(intel?.sourceUrl);
-    if (!currentId) return;
+    const currentFile = currentUploadFile();
     const matching = new Set(
-      existingRenders.filter((r) => ytId(r.sourceUrl) === currentId).map((r) => r.file)
+      existingRenders
+        .filter((r) =>
+          currentId
+            ? ytId(r.sourceUrl) === currentId
+            : Boolean(currentFile) && r.sourceFile === currentFile
+        )
+        .map((r) => r.file)
     );
     if (matching.size === 0) return;
     setRenderedUrls((prev) => {
@@ -208,6 +258,9 @@ export default function Page() {
   // empty box falls back to the built-in concise default.
   const [systemPrompt, setSystemPrompt] = useState("");
   const [showSystemPrompt, setShowSystemPrompt] = useState(false);
+  // Which public URL Buffer will fetch rendered videos from (deployed domain
+  // or the auto-ngrok tunnel). Passive status; the tunnel starts on posting.
+  const [publicUrl, setPublicUrl] = useState<TunnelInfo | null>(null);
 
   useEffect(() => {
     fetch("/api/config")
@@ -219,6 +272,12 @@ export default function Page() {
     fetch("/api/prompts")
       .then((r) => r.json())
       .then((d) => d.systemPrompt && setSystemPrompt(d.systemPrompt))
+      .catch(() => {
+        /* non-fatal */
+      });
+    fetch("/api/tunnel")
+      .then((r) => r.json())
+      .then((d: TunnelInfo) => setPublicUrl(d))
       .catch(() => {
         /* non-fatal */
       });
@@ -275,6 +334,51 @@ export default function Page() {
     }
   }
 
+  async function handleUpload() {
+    if (!sourceFile) return;
+    setError(null);
+    setLoading("upload");
+    try {
+      // Multipart upload — /api/upload saves the file into public/uploads and
+      // returns the same intel shape as /api/analyze. The video FILE is
+      // already on the server, so render needs no download at all.
+      const form = new FormData();
+      form.append("file", sourceFile);
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 900_000); // big files, slow lines
+      let data: any;
+      try {
+        const res = await fetch("/api/upload", {
+          method: "POST",
+          body: form,
+          signal: ctrl.signal,
+        });
+        data = await res.json();
+        if (!res.ok) throw new Error(data.error ?? "Upload failed");
+      } finally {
+        clearTimeout(timer);
+      }
+      setIntel(data.intel);
+      setFilePending(Boolean(data.videoFilePending));
+      // Keep exactly one active source: drop any pasted URL and any edit
+      // plan / renders that belong to a previous video.
+      setYoutubeUrl("");
+      setEditPlan(null);
+      setRenderedUrls({});
+      refreshUploads(); // the freshly uploaded file now shows in storage
+    } catch (e: any) {
+      if (e?.name === "AbortError") {
+        setError(
+          "The upload did not finish within 15 minutes — try a smaller file or a faster connection."
+        );
+      } else {
+        setError(e.message);
+      }
+    } finally {
+      setLoading(null);
+    }
+  }
+
   async function handleStyleProfile() {
     if (!sampleFile) return;
     setError(null);
@@ -309,6 +413,104 @@ export default function Page() {
     }
   }
 
+  // The stored file (basename) backing the currently loaded video, e.g.
+  // "up-1a2b3c4d5e6f.mp4" from intel.videoFilePath …/uploads/<file>.
+  function currentUploadFile(): string {
+    const p = intel?.videoFilePath ?? "";
+    return p ? p.split("/").pop() ?? "" : "";
+  }
+
+  async function handleDeleteRender(file: string) {
+    if (
+      !confirm(
+        `Delete the rendered clip "${file}" from this machine?\n\n` +
+          `If this exact clip is queued or scheduled in Buffer and has NOT published ` +
+          `yet, that post will fail when Buffer tries to fetch the file. Posts that ` +
+          `already published are unaffected.`
+      )
+    )
+      return;
+    setError(null);
+    setLoading(`del-render-${file}`);
+    try {
+      const res = await fetch("/api/renders", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Delete failed");
+      // If a per-clip player above is showing exactly this file, unhook it so
+      // the UI never points at a deleted video.
+      const dead = `/renders/${file}`;
+      setRenderedUrls((prev) => {
+        const next: Record<number, string> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          if (v !== dead) next[Number(k)] = v;
+        }
+        return next;
+      });
+      refreshRenders();
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(null);
+    }
+  }
+
+  // Carry-over: after a reload the app forgot which video you loaded, but the
+  // file is still stored — load it back into Step 01 without re-uploading.
+  async function handleLoadUpload(file: string) {
+    setError(null);
+    setLoading(`load-${file}`);
+    try {
+      const res = await fetch("/api/uploads/load", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Load failed");
+      setIntel(data.intel);
+      setFilePending(Boolean(data.videoFilePending));
+      setYoutubeUrl("");
+      setSourceFile(null);
+      setEditPlan(null);
+      setRenderedUrls({});
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(null);
+    }
+  }
+
+  async function handleDeleteUpload(file: string) {
+    if (
+      !confirm(
+        `Delete the stored source video "${file}" from this machine?\n\n` +
+          `You'd have to upload it (or re-analyze its URL) to render new clips from ` +
+          `it. Nothing already queued in Buffer is affected.`
+      )
+    )
+      return;
+    setError(null);
+    setLoading(`del-upload-${file}`);
+    try {
+      const res = await fetch("/api/uploads", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Delete failed");
+      refreshUploads();
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(null);
+    }
+  }
+
   async function handleGeneratePlan() {
     if (!intel) return;
     setError(null);
@@ -321,12 +523,21 @@ export default function Page() {
         maxClipSec: maxSec,
         aspect: "9:16",
       };
-      const data = await callApi("/api/edit-plan", {
-        intel,
-        rules,
-        styleProfile: styleProfile ?? undefined,
-        systemPrompt,
-      });
+      // Uploaded files have no transcript, so the server analyzes the WHOLE
+      // video visually (ffmpeg scene scan + vision model) before GLM plans —
+      // that legitimately takes 1–4 minutes on longer files. The server's
+      // cap is 300s (maxDuration) — the client must wait that long too,
+      // otherwise it aborts the request right as the server finishes.
+      const data = await callApi(
+        "/api/edit-plan",
+        {
+          intel,
+          rules,
+          styleProfile: styleProfile ?? undefined,
+          systemPrompt,
+        },
+        300_000
+      );
       setEditPlan(data.editPlan);
       setRenderedUrls({});
     } catch (e: any) {
@@ -357,6 +568,40 @@ export default function Page() {
         [clipIndex]: prev[clipIndex] ?? editPlan.clips[clipIndex].hookTitle,
       }));
       setPostMode((prev) => ({ ...prev, [clipIndex]: prev[clipIndex] ?? "queue" }));
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(null);
+    }
+  }
+
+  async function handleDraftCaption(clipIndex: number) {
+    const brief = (postBrief[clipIndex] ?? "").trim();
+    if (!brief) return;
+    setError(null);
+    setLoading(`draft-${clipIndex}`);
+    try {
+      // Reuse the same AI caption engine as the Caption Coach panel, but skip
+      // the Apify web research (saves credits) — the user just wants a draft
+      // from their own brief right next to the post button.
+      const platforms = coachPlatforms(clipIndex);
+      const data = await callApi(
+        "/api/coach/caption",
+        {
+          topic: brief,
+          draftCaption: caption[clipIndex] ?? "",
+          platforms: platforms.length ? platforms : ["instagram"],
+          skipResearch: true,
+        },
+        180_000
+      );
+      const first = data?.captions?.[0];
+      if (!first?.caption) throw new Error(data?.error ?? "No caption drafted");
+      setCaption((prev) => ({ ...prev, [clipIndex]: first.caption }));
+      setPostResult((prev) => ({
+        ...prev,
+        [clipIndex]: `✏ Drafted a ${first.platform} caption from your brief — review & edit above, then post.`,
+      }));
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -412,8 +657,8 @@ export default function Page() {
         </div>
         <h1 style={{ fontSize: 28, margin: 0, fontWeight: 700 }}>Long-form in. Short-form out.</h1>
         <p style={{ color: "#8A8D93", marginTop: 8, fontSize: 14 }}>
-          Apify pulls the video + transcript. GLM plans the edit. Remotion renders it. Post to
-          unlimited Buffer accounts simultaneously.
+          Paste a video link or upload a file from your computer. GLM plans the edit,
+          Remotion renders it. Post to unlimited Buffer accounts simultaneously.
         </p>
       </div>
 
@@ -446,6 +691,32 @@ export default function Page() {
         </div>
       )}
 
+      {/* Public-URL status — Buffer fetches the rendered .mp4 from this URL.
+          "none" is fine: posting auto-starts an ngrok tunnel. */}
+      {publicUrl && (
+        <div style={{ ...stepStyle, marginBottom: 20 }}>
+          <span style={labelStyle}>Public URL for posting</span>
+          {publicUrl.url ? (
+            <p style={{ fontSize: 13, color: "#9FD9A8", margin: 0 }}>
+              Buffer will fetch videos from{" "}
+              <a
+                href={publicUrl.url}
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: "#7CE38B", fontWeight: 600 }}
+              >
+                {publicUrl.url}
+              </a>
+              {publicUrl.mode === "ngrok"
+                ? " — auto-ngrok tunnel. Keep this app running until your posts publish; Buffer re-fetches the video at publish time."
+                : " — from NEXT_PUBLIC_BASE_URL when the video is reachable there; videos that only exist on this machine are served through an automatic ngrok tunnel instead."}
+            </p>
+          ) : (
+            <p style={{ fontSize: 13, color: "#FFD37A", margin: 0 }}>{publicUrl.note}</p>
+          )}
+        </div>
+      )}
+
       {/* Multi-account Buffer management — add/remove API keys, see channels */}
       <AccountsManager accounts={accountChannels} onChanged={refreshAccountsAndChannels} />
 
@@ -469,6 +740,42 @@ export default function Page() {
               : "Analyze video"}
           </button>
         </div>
+
+        {/* …or skip the URL entirely and upload a local video file */}
+        <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "18px 0 12px" }}>
+          <div style={{ flex: 1, height: 1, background: BORDER }} />
+          <span style={{ fontSize: 12, color: "#8A8D93", whiteSpace: "nowrap" }}>
+            or upload a video from your computer
+          </span>
+          <div style={{ flex: 1, height: 1, background: BORDER }} />
+        </div>
+        <input
+          type="file"
+          accept="video/*,.mp4,.mov,.m4v,.webm,.mkv,.avi,.mpg,.mpeg,.flv,.ts"
+          style={{ ...inputStyle, padding: 10 }}
+          onChange={(e) => setSourceFile(e.target.files?.[0] ?? null)}
+        />
+        {sourceFile && (
+          <div style={{ marginTop: 8, fontSize: 13, color: "#8A8D93" }}>
+            Selected: {sourceFile.name} ({(sourceFile.size / 1000000).toFixed(1)} MB)
+          </div>
+        )}
+        <div style={{ marginTop: 12 }}>
+          <button
+            style={loading === "upload" || !sourceFile ? buttonDisabled : buttonStyle}
+            disabled={loading === "upload" || !sourceFile}
+            onClick={handleUpload}
+          >
+            {loading === "upload"
+              ? "Uploading & analyzing… (depends on file size)"
+              : "Analyze uploaded video"}
+          </button>
+        </div>
+        <p style={{ margin: "10px 0 0", fontSize: 12, color: "#8A8D93" }}>
+          Uploaded files usually have no captions, so the AI picks the strongest
+          moments visually (ffmpeg scene-cut analysis + the vision model) instead
+          of from spoken lines.
+        </p>
         {intel && (
           <div style={{ marginTop: 12, fontSize: 13, color: "#8A8D93" }}>
             Loaded "{intel.title}" — {Math.round(intel.durationSec)}s, {intel.transcript.length} transcript words.
@@ -593,14 +900,32 @@ export default function Page() {
             <input type="number" style={inputStyle} value={maxSec} onChange={(e) => setMaxSec(Number(e.target.value))} />
           </div>
         </div>
+        {intel && intel.transcript?.length === 0 && (
+          <p style={{ margin: "12px 0 0", fontSize: 12, color: "#8A8D93" }}>
+            Uploaded videos have no transcript, so your free-text rules steer the&nbsp;AI&apos;s
+            visual analysis (what counts as an interesting moment) and the clip count /
+            length bounds below. Rules that quote spoken lines can&apos;t match — there are no
+            words to match yet.
+          </p>
+        )}
         <div style={{ marginTop: 12 }}>
           <button
             style={loading === "plan" || !intel ? buttonDisabled : buttonStyle}
             disabled={loading === "plan" || !intel}
             onClick={handleGeneratePlan}
           >
-            {loading === "plan" ? "GLM is planning the edit…" : "Generate edit plan"}
+            {loading === "plan"
+              ? "Analyzing video + planning… (1–4 min, don't close)"
+              : "Generate edit plan"}
           </button>
+          {!filePending && intel && (
+            <p style={{ margin: "8px 0 0", fontSize: 12, color: "#8A8D93" }}>
+              Uploaded videos have no transcript, so the first step scans the
+              whole file visually (scene cuts + vision model) — this can take a
+              few minutes for long videos. Your earlier request hit a timeout at
+              exactly 2 minutes and got aborted; it now waits up to 5 minutes.
+            </p>
+          )}
         </div>
       </section>
 
@@ -620,6 +945,16 @@ export default function Page() {
                 <div style={{ fontSize: 12, color: "#8A8D93", marginTop: 6 }}>
                   {r.hookTitle || r.file} · {r.sizeMb} MB
                 </div>
+                <button
+                  style={
+                    loading === `del-render-${r.file}` ? dangerButtonDisabled : dangerButton
+                  }
+                  disabled={loading === `del-render-${r.file}`}
+                  onClick={() => handleDeleteRender(r.file)}
+                  title="Delete this rendered clip from this machine"
+                >
+                  {loading === `del-render-${r.file}` ? "Deleting…" : "Delete"}
+                </button>
               </div>
             ))}
           </div>
@@ -628,6 +963,78 @@ export default function Page() {
             only through the “Post via Buffer” controls, which stay locked until a clip is
             rendered for the current video.
           </p>
+        </section>
+      )}
+
+      {/* Storage management: source videos cached on this machine */}
+      {storedUploads.length > 0 && (
+        <section style={stepStyle}>
+          <span style={labelStyle}>Source videos stored on this machine</span>
+          <p style={{ fontSize: 13, color: "#8A8D93", margin: "0 0 12px" }}>
+            Every video file the pipeline saved while you worked — URL downloads and your
+            own uploads. Deleting removes only the local copy; anything already queued in
+            Buffer stays live. The video currently loaded in Step 01 is protected.
+          </p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {storedUploads.map((u) => {
+              const inUse = currentUploadFile() === u.file;
+              return (
+                <div
+                  key={u.file}
+                  style={{ display: "flex", alignItems: "center", gap: 12 }}
+                >
+                  <span
+                    style={{
+                      fontSize: 13,
+                      color: "#E8E6E1",
+                      flex: 1,
+                      overflowWrap: "anywhere",
+                    }}
+                  >
+                    {u.file}{" "}
+                    <span style={{ color: "#8A8D93" }}>
+                      · {u.sizeMb} MB · {new Date(u.modified).toLocaleString()}
+                      {inUse ? " · in use right now" : ""}
+                    </span>
+                  </span>
+                  <button
+                    style={{
+                      ...buttonStyle,
+                      padding: "6px 14px",
+                      fontSize: 12,
+                      background: "#2A2D31",
+                      color: "#E8E6E1",
+                    }}
+                    disabled={loading === `load-${u.file}`}
+                    onClick={() => handleLoadUpload(u.file)}
+                    title="Load this stored video back into Step 01 without re-uploading (avoids duplicate copies)"
+                  >
+                    {loading === `load-${u.file}` ? "Loading…" : "Load"}
+                  </button>
+                  <button
+                    style={
+                      inUse || loading === `del-upload-${u.file}`
+                        ? dangerButtonDisabled
+                        : dangerButton
+                    }
+                    disabled={inUse || loading === `del-upload-${u.file}`}
+                    onClick={() => handleDeleteUpload(u.file)}
+                    title={
+                      inUse
+                        ? "This video is loaded in Step 01 — analyze a different video first"
+                        : "Delete this stored video from this machine"
+                    }
+                  >
+                    {loading === `del-upload-${u.file}`
+                      ? "Deleting…"
+                      : inUse
+                        ? "In use"
+                        : "Delete"}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
         </section>
       )}
 
@@ -651,9 +1058,19 @@ export default function Page() {
                 onClick={() => handleRender(i)}
               >
                 {loading === `render-${i}`
-                  ? "Downloading source + rendering… (3–8 min, don't close)"
+                  ? (filePending
+                      ? "Downloading source + rendering… (3–8 min, don't close)"
+                      : "Rendering… (1–4 min, don't close)")
                   : "Render clip"}
               </button>
+              {!renderedUrls[i] && (
+                <p style={{ margin: "8px 0 0", fontSize: 12, color: "#8A8D93" }}>
+                  Click Render clip and wait for it to finish — the video player, the
+                  “Post via Buffer” section and the “Tell the AI what to post” box all
+                  appear right here once the clip is rendered. (First render downloads
+                  the source if needed and runs the whole Remotion pass.)
+                </p>
+              )}
               {renderedUrls[i] && (
                 <>
                   <video
@@ -701,6 +1118,44 @@ export default function Page() {
                         ))}
                       </div>
                     )}
+
+                    <div
+                      style={{
+                        marginBottom: 10,
+                        padding: "10px 12px",
+                        border: `1px dashed ${ACCENT}`,
+                        borderRadius: 6,
+                        background: "#1A120B",
+                      }}
+                    >
+                      <div style={{ fontSize: 12, color: "#FF9B7A", fontWeight: 700, marginBottom: 6 }}>
+                        Tell the AI what to post
+                      </div>
+                      <input
+                        style={inputStyle}
+                        placeholder={
+                          'e.g. "Home-gym workout for beginners — fun, energetic, ' +
+                            'ask people to comment their favorite move, use 3 hashtags"'
+                        }
+                        value={postBrief[i] ?? ""}
+                        onChange={(e) =>
+                          setPostBrief((prev) => ({ ...prev, [i]: e.target.value }))
+                        }
+                      />
+                      <button
+                        style={
+                          loading === `draft-${i}` || !(postBrief[i] ?? "").trim()
+                            ? buttonDisabled
+                            : buttonStyle
+                        }
+                        disabled={loading === `draft-${i}` || !(postBrief[i] ?? "").trim()}
+                        onClick={() => handleDraftCaption(i)}
+                      >
+                        {loading === `draft-${i}`
+                          ? "Drafting with AI… (up to 3 min)"
+                          : "✏ Draft caption with AI"}
+                      </button>
+                    </div>
 
                     <textarea
                       style={{ ...inputStyle, minHeight: 60, resize: "vertical", marginBottom: 10 }}

@@ -35,14 +35,23 @@ npm run dev
 
 1. **Analyze** (`/api/analyze`) — you paste a YouTube URL, Apify returns title, duration,
    word-level transcript, and optionally scene cuts.
+   - **Or upload a local file** (`/api/upload`) — Step 01 also accepts a video file from
+     your computer (mp4/mov/m4v/webm/mkv/avi/mpg/flv/ts). It's saved into `public/uploads`,
+     non-mp4 containers are remuxed to mp4, and the duration is read with ffprobe. Uploaded
+     files carry no transcript, so the edit planner falls back to visual mode: ffmpeg
+     scene-cut analysis (+ vision-model frame notes) picks the strongest moments instead of
+     spoken lines. Renders need no download for uploads — the file is already on disk.
 2. **Style profile (optional)** (`/api/style-profile`) — paste a sample short whose editing
    technique you want copied. GLM infers a structured "style profile" (cut pacing, caption
    style, zoom rhythm) from that sample's transcript/scene data.
 3. **Rules** — free-text instructions plus clip count/length constraints. These live in the
    UI state, not hardcoded, so you can change them between every single run.
-4. **Generate edit plan** (`/api/edit-plan`) — GLM receives the transcript, your current
-   rules, and the optional style profile, and returns a JSON `EditPlan`: which time ranges
-   to clip, per-clip captions with timing, and zoom/pan keyframes.
+4. **Generate edit plan** (`/api/edit-plan`) — for URL videos GLM receives the transcript,
+   your current rules, and the optional style profile, and returns a JSON `EditPlan`. For
+   **uploaded files (no transcript)** the server first scans the whole video visually
+   (ffmpeg scene-cut detection + vision-model frame notes) and *then* plans — so the
+   "Generate edit plan" button takes **1–4 minutes** on longer uploads and the browser
+   waits up to 300s (the route's `maxDuration`); don't close the tab while it runs.
 5. **Render** (`/api/render`) — for each clip, Remotion's renderer (`@remotion/renderer`)
    renders the `ShortClip` composition (`remotion/ShortClip.tsx`) into an `.mp4` using that
    clip's plan: 9:16 crop, burned-in captions, zoom/pan.
@@ -114,17 +123,21 @@ The **Caption coach** panel takes a topic (and optionally your draft caption):
    organization from the token automatically via Buffer's `account` query.
    Set it only if one key reaches multiple Buffer organizations and you want
    to pin a specific one.
-4. Set `NEXT_PUBLIC_BASE_URL` to your **real deployed domain**, not `localhost`. This is not
-   optional: Buffer's API has no file-upload endpoint — it only accepts a public URL and
+4. `NEXT_PUBLIC_BASE_URL` should point at your **real deployed domain** when running in
+   production — Buffer's API has no file-upload endpoint, it only accepts a public URL and
    fetches the media itself, both when you create the post and again when it publishes
-   (which can be hours or days later for scheduled/queued posts). If you're testing locally,
-   posting will fail because Buffer's servers can't reach `localhost`. Deploy somewhere
-   public (Vercel, etc.) or tunnel with something like ngrok for local testing, and make sure
-   the render output stays on disk/reachable until the post actually goes out — don't clear
-   `public/renders` right after posting.
-5. Avoid signed/expiring URLs for the video — `NEXT_PUBLIC_BASE_URL` + the static
-   `/renders/*.mp4` path Next.js serves from `public/` works fine since it's a plain public
-   file, not a signed link.
+   (which can be hours or days later for scheduled/queued posts), so the render output must
+   stay on disk/reachable until the post actually goes out — don't clear `public/renders`
+   right after posting.
+   **Local development needs no setup**: if `NEXT_PUBLIC_BASE_URL` is unset — or set but the
+   video doesn't answer through it — long2short automatically starts an **ngrok tunnel**
+   when you post and hands Buffer that URL instead (see `NGROK_AUTHTOKEN` in
+   `.env.local.example`; requires the ngrok binary — `winget install ngrok.ngrok`). The
+   tunnel lives as long as the dev server does: keep the app running until scheduled posts
+   publish. To opt out, set a deployed domain in `NEXT_PUBLIC_BASE_URL` where the renders
+   actually exist.
+5. Avoid signed/expiring URLs for the video — the static `/renders/*.mp4` path Next.js
+   serves from `public/` works fine since it's a plain public file, not a signed link.
 
 
 
@@ -134,8 +147,11 @@ ways this app handles style extraction, toggled by the "Use vision model" checkb
 - **Off (default, text-only)** — `extractStyleProfile()` infers cut length/caption/zoom
   patterns from the sample's transcript timing and scene-cut timestamps only.
 - **On (vision-based)** — `extractStyleProfileVision()` pulls ~8 evenly-spaced frames from
-  the sample video with `ffmpeg` (via `lib/ffmpegFrames.ts`) and sends them as `image_url`
-  blocks to a vision-capable model on build.nvidia.com. Requires:
+  the sample video with `ffmpeg` (via `lib/ffmpegFrames.ts`) and sends **each frame in its
+  own request** (the hosted endpoint answers 400 "At most 1 image(s) may be provided in one
+  prompt" if multiple images are sent together) to a vision-capable model on build.nvidia.com.
+  Cut pacing is measured with ffmpeg's scene detector rather than guessed from stills.
+  Requires:
   - `ffmpeg` installed and on `PATH` wherever this app runs (not bundled — install it
     separately, e.g. `apt install ffmpeg` / `brew install ffmpeg`).
   - `NVIDIA_VISION_MODEL` set in `.env.local` to a real vision-capable catalog ID. Check
@@ -166,5 +182,8 @@ shared hosted catalog endpoint.
 - Buffer's GraphQL API is in public beta as of this writing and its schema/rate limits may
   shift — if `createPost`/channel queries in `lib/buffer.ts` start erroring, check
   developers.buffer.com for schema changes before assuming the code is wrong.
-- `public/renders` grows forever since nothing deletes old clips — add cleanup once a post
-  has published (check Buffer's post status) or on a retention schedule.
+- `public/renders` / `public/uploads` still grow between sessions — you can delete old
+  clips and stored source videos manually from the UI ("Rendered clips on this machine"
+  and "Source videos stored on this machine" panels), but there's no automatic cleanup
+  once a post has published (that would require checking Buffer's post status) or on a
+  retention schedule.

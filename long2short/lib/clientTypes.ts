@@ -34,4 +34,13 @@ export interface PostTargetResult {
 export interface PostResponse {
   results: PostTargetResult[];
   summary: { total: number; succeeded: number; failed: number };
+  /** Base URL Buffer fetched the video from (deployed domain or ngrok tunnel). */
+  publicBaseUrl?: string;
+}
+
+/** Shape of GET /api/tunnel (see lib/tunnel.ts tunnelStatus()). */
+export interface TunnelInfo {
+  mode: "env" | "ngrok" | "none";
+  url: string | null;
+  note?: string;
 }
